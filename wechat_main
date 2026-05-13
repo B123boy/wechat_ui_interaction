@@ -1,0 +1,339 @@
+import uiautomation as auto
+import time
+import json
+import os
+import threading
+import requests
+import re
+from datetime import datetime, timedelta
+
+# ================= 配置区 =================
+VERSION = "v2.7_终极免维护版"
+DB_FILE = 'chat_data.json'          
+ROSTER_FILE = 'all_members.txt'     
+REPORT_FILE = '群活跃度报表.txt'    
+UPDATE_TIME = "08:00"               
+
+# 【核心配置】
+TRIGGER_KEYWORD = "bot"             # 触发暗号
+MY_WECHAT_NAME = "你的真实昵称"     # 防止机器人统计自己
+DEEPSEEK_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxx" # ⚠️请填入真实Key
+
+# --- 线程与并发控制锁 ---
+wechat_lock = threading.Lock()
+thread_counter_lock = threading.Lock()  
+MAX_AI_THREADS = 2                      
+ai_thread_count = 0                     
+
+print("="*50)
+print(f"📊 微信社群 CRM 监控分析系统 ({VERSION}) 已启动")
+print("="*50)
+
+# ================= 1. 数据引擎初始化 (原子写入+备份机制) =================
+def load_db():
+    bak_file = DB_FILE + '.bak'
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ 主数据文件异常 ({e})，正在尝试从备份恢复...")
+            
+    if os.path.exists(bak_file):
+        try:
+            with open(bak_file, 'r', encoding='utf-8') as f:
+                db_data = json.load(f)
+                print("✅ 成功从备份文件抢救回历史数据，将在此基础上继续累加！")
+                return db_data
+        except Exception as e:
+            print(f"❌ 备份文件读取也失败: {e}")
+            
+    return {}
+
+def save_db(data):
+    tmp_file = DB_FILE + '.tmp'
+    bak_file = DB_FILE + '.bak'
+    try:
+        with open(tmp_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        if os.path.exists(DB_FILE):
+            os.replace(DB_FILE, bak_file)
+        os.replace(tmp_file, DB_FILE)
+    except Exception as e:
+        print(f"❌ 保存数据出错: {e}")
+
+def load_roster():
+    if os.path.exists(ROSTER_FILE):
+        with open(ROSTER_FILE, 'r', encoding='utf-8') as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+# ================= 2. 核心统计与报表生成 =================
+def generate_report(db, roster):
+    today = datetime.now()
+    stats_today, stats_7_days, stats_30_days = {}, {}, {}
+    for date_str, users in db.items():
+        record_date = datetime.strptime(date_str, "%Y-%m-%d")
+        days_diff = (today - record_date).days
+        for user, count in users.items():
+            if days_diff <= 30: stats_30_days[user] = stats_30_days.get(user, 0) + count
+            if days_diff <= 7:  stats_7_days[user] = stats_7_days.get(user, 0) + count
+            if days_diff == 0:  stats_today[user] = stats_today.get(user, 0) + count
+    inactive_users = roster - set(stats_7_days.keys())
+    with open(REPORT_FILE, 'w', encoding='utf-8') as f:
+        f.write(f"【社群活跃度分析报告】\n报表生成时间: {today.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("--- 今日发言统计 ---\n")
+        for user, count in sorted(stats_today.items(), key=lambda x: x[1], reverse=True):
+            f.write(f"{user} {count}\n")
+        f.write("\n--- ⚠️ 近7天潜水人员 ---\n")
+        for user in inactive_users: f.write(f"{user} 0\n")
+    print(f"📄 [报表刷新] 内存统计已同步至文件")
+
+# ================= 3. UI 发送引擎 (带锁保护) =================
+def send_wechat_msg_safe(content):
+    with wechat_lock:
+        try:
+            auto.SetClipboardText(content)
+            wechat_win = auto.WindowControl(ClassName='WeChatMainWndForPC')
+            wechat_win.SetActive()
+            time.sleep(0.2)
+            
+            input_box = wechat_win.EditControl(Name='输入')
+            if not input_box.Exists(0.2):
+                input_box = wechat_win.EditControl(Name='消息')
+                
+            if input_box.Exists(0.1):
+                input_box.SetFocus()
+            else:
+                print("   ⚠️ 警告: 未找到输入框特征，尝试强制注入...")
+                
+            time.sleep(0.2)
+            auto.SendKeys('{Ctrl}v', waitTime=0.1)
+            auto.SendKeys('{Enter}', waitTime=0.1)
+            print(f"✅ 回复已成功投递")
+        except Exception as e:
+            print(f"❌ 发送过程出错: {e}")
+
+# ================= 4. AI 异步处理引擎 =================
+def ask_deepseek_task(sender, prompt, history_context):
+    global ai_thread_count
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
+    }
+    sys_prompt = "你是一个有用的社群助手。请根据下方提供的【近期群聊历史】了解聊天上下文，连贯且自然地回复最后一位用户的提问。不要重复别人的话，直接给出你的回答。"
+    if history_context:
+        sys_prompt += f"\n\n【近期群聊历史】:\n{history_context}"
+
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        "stream": False
+    }
+    
+    try:
+        print(f"🚀 AI 开始处理 [ {sender} ] 的请求 (当前并发: {ai_thread_count}/{MAX_AI_THREADS})...")
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        if response.status_code == 200:
+            ai_content = response.json()['choices'][0]['message']['content'].strip()
+            final_reply = f"@{sender}\n🤖 AI 回复：\n----------------\n{ai_content}"
+            send_wechat_msg_safe(final_reply)
+        else:
+            print(f"❌ AI 接口异常代码: {response.status_code}")
+    except Exception as e:
+        print(f"⚠️ AI 任务中断: {e}")
+    finally:
+        with thread_counter_lock:
+            if ai_thread_count > 0:
+                ai_thread_count -= 1
+
+# ================= 5. 花名册抓取与监控 =================
+def auto_update_roster(wechat_win):
+    print("\n🔄 触发花名册更新...")
+    chat_info_btn = wechat_win.ButtonControl(Name='聊天信息')
+    if not chat_info_btn.Exists(3): return False
+    chat_info_btn.Click(simulateMove=False)
+    time.sleep(2) 
+    more_btn = wechat_win.ButtonControl(Name='查看更多')
+    if more_btn.Exists(3): more_btn.Click(simulateMove=False)
+    time.sleep(2) 
+    member_list_container = wechat_win.ListControl(Name='聊天成员')
+    if not member_list_container.Exists(5): return False
+    
+    rect = member_list_container.BoundingRectangle
+    auto.SetCursorPos(rect.left + 30, rect.top + 30)
+    roster = set()
+    while True:
+        current_names = []
+        for control, depth in auto.WalkControl(member_list_container, includeTop=False, maxDepth=15):
+            if control.ControlTypeName == 'ListItemControl' and control.Name:
+                name = control.Name
+                if name not in ["", "添加", "移出", "查看更多", "聊天成员", "群聊名称", "群公告", "备注和标签"]:
+                    current_names.append(name)
+        old_size = len(roster)
+        roster.update(current_names)
+        auto.WheelDown(wheelTimes=5)
+        time.sleep(1.5) 
+        if len(roster) == old_size: break
+            
+    with open(ROSTER_FILE, 'w', encoding='utf-8') as f:
+        for member in sorted(roster): f.write(member + '\n')
+    chat_info_btn.Click(simulateMove=False) 
+    print(f"✅ 更新完成")
+    return True
+
+# ================= 6. 主控监听系统 =================
+wechat_win = auto.WindowControl(ClassName='WeChatMainWndForPC')
+if not wechat_win.Exists(3, 1): exit()
+
+wechat_win.SetActive()
+msg_list = wechat_win.ListControl(Name='消息')
+print("✅ 系统就绪，防爆保护、断点续传、数据瘦身与异步缓冲机制已全部开启...")
+
+db_cache = load_db()
+current_roster = load_roster() 
+last_update_date_str = "" 
+
+recent_messages = []        
+global_chat_history = []    
+recent_processed_queue = [] 
+
+msg_buffer_count = 0
+last_save_time = datetime.now()
+
+while True:
+    try:
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        current_time_str = now.strftime("%H:%M")
+        
+        # 每天早八点：更新花名册、清理过期数据、生成报表
+        if current_time_str >= UPDATE_TIME and last_update_date_str != today_str:
+            last_update_date_str = today_str 
+            auto_update_roster(wechat_win)
+            current_roster = load_roster()
+            
+            # 【核心瘦身机制】：清理超过 35 天的历史数据，防止内存撑爆
+            cutoff_date = now - timedelta(days=35)
+            expired_keys = []
+            for date_key in db_cache.keys():
+                try:
+                    if datetime.strptime(date_key, "%Y-%m-%d") < cutoff_date:
+                        expired_keys.append(date_key)
+                except ValueError:
+                    pass
+            for k in expired_keys: 
+                del db_cache[k]
+                
+            # 【修复二】：内存清理完之后强制落盘，防止断电导致瘦身失效
+            save_db(db_cache)
+            
+            # 【修复一】：报表生成加装防震垫
+            try:
+                generate_report(db_cache, current_roster)
+            except Exception as e:
+                print(f"⚠️ 生成报表被拦截(文件可能正被占用): {e}")
+                
+            msg_list = wechat_win.ListControl(Name='消息') 
+
+        # ================= UI 提取区 =================
+        extracted_data = []
+        with wechat_lock:
+            messages = msg_list.GetChildren()
+            if messages:
+                for last_msg in messages[-5:]:
+                    current_text = last_msg.Name
+                    if current_text:
+                        sender_name = ""
+                        for child, depth in auto.WalkControl(last_msg, includeTop=False, maxDepth=3):
+                            if child.ControlTypeName == 'ButtonControl' and child.Name:
+                                sender_name = child.Name
+                                break
+                        extracted_data.append((sender_name, current_text))
+        
+        # ================= 逻辑处理区 =================
+        for sender_name, current_text in extracted_data:
+            if sender_name and sender_name not in ["微信红包", "系统提示"]:
+                msg_signature = (sender_name, current_text)
+                
+                if msg_signature not in recent_processed_queue:
+                    recent_processed_queue.append(msg_signature)
+                    if len(recent_processed_queue) > 20:
+                        recent_processed_queue.pop(0)
+
+                    print(f"🔍 监控到新消息: {current_text}")
+                    
+                    is_bot = (sender_name == MY_WECHAT_NAME)
+                    
+                    if not is_bot:
+                        if today_str not in db_cache: db_cache[today_str] = {}
+                        db_cache[today_str][sender_name] = db_cache[today_str].get(sender_name, 0) + 1
+                        
+                        msg_buffer_count += 1
+                        
+                        recent_messages.append((now, sender_name))
+                        recent_messages = [m for m in recent_messages if m[0] >= (now - timedelta(minutes=30))]
+                        
+                    safe_text = current_text if len(current_text) <= 100 else current_text[:100] + "..."
+                    global_chat_history.append((now, sender_name, safe_text))
+                    cutoff_8h = now - timedelta(hours=8)
+                    global_chat_history = [m for m in global_chat_history if m[0] >= cutoff_8h][-100:]
+                    
+                    if not is_bot and ("@" in current_text or "＠" in current_text) and TRIGGER_KEYWORD in current_text:
+                        prompt = re.sub(rf"(@|＠){TRIGGER_KEYWORD}\s*", "", current_text, flags=re.IGNORECASE).strip()
+                        prompt_length = len(prompt)
+                        
+                        if "规则" in current_text and prompt_length <= 4:
+                            reply = f"@{sender_name}\n群规提醒：入群/近30天发言需满5次，否则会被清理。"
+                            send_wechat_msg_safe(reply)
+                            
+                        elif "颜值担当" in current_text and prompt_length <= 4:
+                            counts = {}
+                            for ts, name in recent_messages: counts[name] = counts.get(name, 0) + 1
+                            winner = sender_name
+                            if counts:
+                                max_c = max(counts.values())
+                                running = {}
+                                for ts, name in recent_messages:
+                                    running[name] = running.get(name, 0) + 1
+                                    if running[name] == max_c:
+                                        winner = name
+                                        break
+                            send_wechat_msg_safe(f"颜值担当是 @{winner}")
+                            
+                        else:
+                            if prompt:
+                                with thread_counter_lock:
+                                    if ai_thread_count >= MAX_AI_THREADS:
+                                        send_wechat_msg_safe(f"@{sender_name}\n⚠️ AI 脑壳痛，当前提问人数过多，请排队稍后再试哦~")
+                                        continue
+                                    else:
+                                        ai_thread_count += 1
+                                        
+                                history_str = ""
+                                for ts, name, text in global_chat_history:
+                                    history_str += f"[{name}]: {text}\n"
+                                
+                                threading.Thread(target=ask_deepseek_task, args=(sender_name, prompt, history_str)).start()
+
+        # ================= 异步缓冲落盘区 =================
+        if msg_buffer_count > 0:
+            if msg_buffer_count >= 100 or (now - last_save_time).total_seconds() >= 300:
+                save_db(db_cache)
+                
+                # 【修复一】：报表生成加装防震垫，绝不影响计数器清零
+                try:
+                    generate_report(db_cache, current_roster)
+                except Exception as e:
+                    print(f"⚠️ 缓冲落盘后生成报表被拦截(文件可能正被占用): {e}")
+                    
+                msg_buffer_count = 0
+                last_save_time = now
+
+    except Exception as e:
+        print(f"⚠️ 核心循环异常: {e}")
+    time.sleep(1)
